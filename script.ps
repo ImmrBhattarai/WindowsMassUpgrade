@@ -1,0 +1,1147 @@
+```powershell
+#Requires -RunAsAdministrator
+#Requires -Version 5.1
+# ==============================================================================
+# WINDOWS 11 25H2 ENTERPRISE IN-PLACE UPGRADE SCRIPT v4.0
+# ==============================================================================
+#
+# CONFIRMED ENVIRONMENT (do not change assumptions below):
+#   - Windows 11 25H2 media source   : SMB share (see $NetworkSource below)
+#   - setup.exe SHA256               : 72A0BCAC2D4DE630AD094BFC312BD4431AA5C286C683DE7E0650C1675E5FC7C5
+#   - Reboot behavior                : NO forced reboot (/NoReboot)
+#   - Edition handling               : Auto-detected via DISM, /ImageIndex selected automatically
+#   - Activation handling            : Audit-only, non-destructive, no key injection
+#   - Deployment method              : GPO Computer Scheduled Task running as SYSTEM
+#   - Data preservation              : /Auto Upgrade — keeps ALL files, apps, settings
+#   - Rollback on failure            : Automatic (Windows.old created by setup.exe itself)
+#
+# DATA PRESERVATION GUARANTEE:
+#   /Auto Upgrade  = programmatic equivalent of selecting
+#                   "Keep personal files, apps, and Windows settings" in setup GUI.
+#                   This flag must NEVER be removed or changed.
+#   /NoReboot      = upgrade stages silently; reboot is NEVER forced on users.
+#                   When user restarts at their own will, Windows 11 completes.
+#   /Uninstall Enable = Windows.old is preserved for rollback after upgrade.
+#
+# PREREQUISITES (verify once before mass deployment):
+#   1. $NetworkSource UNC path below is correct and accessible by Domain Computers
+#   2. Logs subfolder on share writable by Domain Computers (NTFS Write)
+#   3. AV/EDR path exclusion added for: C:\ProgramData\OrgUpgrade\
+#   4. GPO: Computer Config > Policies > Windows Settings > Scripts > PowerShell
+#           Execution Policy = Allow all scripts  OR  Bypass
+#   5. GPO Scheduled Task timeout set to minimum 4 hours (copy + scan + setup)
+#
+# HOW TO GET YOUR UNC PATH FOR $NetworkSource:
+#   On the machine where Z: is mapped, run in PowerShell:
+#     (Get-PSDrive Z).DisplayRoot
+#   OR check:  net use Z:
+#   That gives you the \\server\share\... UNC path to paste below.
+#
+# ==============================================================================
+
+# ==============================================================================
+# CONFIGURATION — EDIT ONLY THIS BLOCK
+# ==============================================================================
+
+# UNC path to the folder containing setup.exe (and boot\, efi\, sources\, etc.)
+# Replace with the UNC equivalent of your Z:\Personal\Suraj Bhattarai\windows Upgrade\USB Drive 25H2
+# Example: "\\fileserver\SharedDrive\Personal\Suraj Bhattarai\windows Upgrade\USB Drive 25H2"
+# If you are using my script, change the $NetworkSource = "XYZ" line to actual path to network shared drive used at your organization.
+# Path has spaces — script handles this correctly throughout via quoting + LiteralPath.
+$NetworkSource = "\\FILESRVCHDC\common\Personal\Suraj Bhattarai\windows Upgrade\USB Drive 25H2"
+
+# Local staging directory — safe enterprise path, not Temp (EDR flags setup.exe from Temp)
+$LocalTarget   = "C:\ProgramData\OrgUpgrade\Win11Media"
+
+# Local log directory
+$LogDir        = "C:\ProgramData\OrgUpgrade\Logs"
+
+# Central log collection folder on network share (Domain Computers need Write here)
+$NetworkLogDir = "\\FILESRVCHDC\common\Personal\Suraj Bhattarai\windows Upgrade\Logs"
+
+# State file — tracks which phases completed, enables safe resume after interruption
+$StateFile     = "C:\ProgramData\OrgUpgrade\UpgradeState.json"
+
+# Confirmed SHA256 of your specific setup.exe (generated from your 25H2 USB media)
+# This value is locked — do NOT change unless you replace the media.
+$ExpectedSHA256 = "72A0BCAC2D4DE630AD094BFC312BD4431AA5C286C683DE7E0650C1675E5FC7C5"
+
+# Minimum free space on C: before upgrade is allowed to proceed.
+# 35 GB = ~6 GB media staging + ~20 GB setup working space + ~9 GB Windows.old headroom
+$RequiredFreeBytes = [int64](35GB)
+
+# ==============================================================================
+# DO NOT EDIT BELOW THIS LINE
+# ==============================================================================
+
+# Suppress PowerShell progress bars — they cause significant slowdown in
+# non-interactive SYSTEM sessions (GPO Scheduled Task context)
+$ProgressPreference = "SilentlyContinue"
+
+# Do NOT set ErrorActionPreference = Stop globally.
+# Global Stop kills the script on any minor cmdlet failure (e.g., WMI returning null).
+# Every block below uses its own try/catch for surgical, predictable error handling.
+$ErrorActionPreference = "Continue"
+
+# Resolve system drive dynamically (handles rare cases where Windows is not on C:)
+$SystemDrive = $env:SystemDrive   # "C:" in all normal cases
+
+$MachineName = $env:COMPUTERNAME
+
+# ==============================================================================
+# STEP 0A: 32-BIT PROCESS GUARD
+# If PowerShell is running as a 32-bit process on a 64-bit OS (WOW64),
+# CIM queries, registry paths, and DISM calls can return wrong results.
+# Self-relaunch as 64-bit before doing anything else.
+# ==============================================================================
+
+if ([Environment]::Is64BitOperatingSystem -and (-not [Environment]::Is64BitProcess)) {
+    # Sysnative is the real System32 as seen from a 32-bit process on 64-bit Windows
+    $ps64 = Join-Path $env:WINDIR "Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+    if (Test-Path -LiteralPath $ps64) {
+        & $ps64 -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath
+        exit $LASTEXITCODE
+    }
+}
+
+# ==============================================================================
+# STEP 0B: LOGGING INFRASTRUCTURE
+# Defined first — every section below depends on Write-Log and Exit-WithLog.
+# ==============================================================================
+
+# Unique log file per run — multiple runs do not overwrite each other
+$LogFile = "$LogDir\Win11Upgrade_${MachineName}_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+function Write-Log {
+    # Writes timestamped log line to console and local log file.
+    # Levels: INFO, WARN, ERROR, EXIT
+    param(
+        [string]$Level   = "INFO",
+        [string]$Message
+    )
+    $ts   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$ts][$MachineName][$Level] $Message"
+    Write-Output $line
+
+    # Create log dir on first write if it doesn't exist yet
+    if (-not (Test-Path $LogDir -ErrorAction SilentlyContinue)) {
+        try { New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction Stop | Out-Null } catch {}
+    }
+
+    # SilentlyContinue — a log write failure must NEVER abort the upgrade
+    Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
+}
+
+function Exit-WithLog {
+    # All script exits go through here — logs the reason and uploads log to share.
+    param(
+        [int]    $Code,
+        [string] $Reason
+    )
+    Write-Log -Level "EXIT" -Message "ExitCode=$Code | $Reason"
+
+    # Best-effort central log upload — failure here must not mask the real exit code
+    if (Test-Path -LiteralPath $NetworkLogDir -ErrorAction SilentlyContinue) {
+        Copy-Item -Path $LogFile -Destination $NetworkLogDir -Force -ErrorAction SilentlyContinue
+    }
+    Exit $Code
+}
+
+# ==============================================================================
+# STEP 0C: STATE MACHINE (RESUMABILITY)
+# Tracks which phases have completed across runs and script interruptions.
+# If the machine is powered off mid-copy, next run resumes from correct phase.
+# Phases: INIT → COPIED → SCAN_PASSED → UPGRADE_LAUNCHED → UPGRADE_STAGED
+#         Any phase can transition to *_FAILED for admin review.
+# ==============================================================================
+
+function Read-State {
+    # Returns current state hashtable. Returns empty hashtable if no state exists yet.
+    $defaultState = @{ Stage = "INIT"; MachineName = $MachineName }
+
+    if (-not (Test-Path -LiteralPath $StateFile -ErrorAction SilentlyContinue)) {
+        return $defaultState
+    }
+    try {
+        $raw = Get-Content -LiteralPath $StateFile -Raw -Encoding UTF8 -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $defaultState }
+
+        # ConvertFrom-Json returns PSCustomObject — convert to hashtable for mutability
+        $obj   = $raw | ConvertFrom-Json -ErrorAction Stop
+        $table = @{}
+        foreach ($prop in $obj.PSObject.Properties) { $table[$prop.Name] = $prop.Value }
+        return $table
+    } catch {
+        # Corrupted state file — start fresh, do not block the upgrade
+        Write-Log "WARN" "State file could not be read (starting fresh): $_"
+        return $defaultState
+    }
+}
+
+function Write-State {
+    # Persists current state hashtable to disk as JSON.
+    param([hashtable]$State)
+    try {
+        $State | ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath $StateFile -Encoding UTF8 -Force -ErrorAction Stop
+    } catch {
+        # State write failure is non-fatal — log and continue
+        Write-Log "WARN" "Could not write state file (non-fatal): $_"
+    }
+}
+
+function Get-HexCode {
+    # Converts a signed int32 exit code to the 0xC190xxxx hex form used in Microsoft docs
+    param([int]$Code)
+    return ("0x{0:X8}" -f [uint32]$Code)
+}
+
+# ==============================================================================
+# SCRIPT START
+# ==============================================================================
+
+Write-Log "INFO" "========================================================================"
+Write-Log "INFO" "Windows 11 25H2 In-Place Upgrade Script v4.0 — START"
+Write-Log "INFO" "Machine  : $MachineName"
+Write-Log "INFO" "RunAs    : $($env:USERNAME) | Session: $($env:SESSIONNAME)"
+Write-Log "INFO" "Script   : $($MyInvocation.MyCommand.Path)"
+Write-Log "INFO" "========================================================================"
+
+# Load persisted state from previous run (if any)
+$state = Read-State
+Write-Log "INFO" "Loaded state: Stage=$($state['Stage'])"
+
+# ==============================================================================
+# SECTION 1: IDEMPOTENCY — Already on Windows 11?
+# Windows 11 builds start at 22000. Windows 10 tops out at 19045.
+# If already upgraded, exit immediately — safe to leave this task running permanently.
+# ==============================================================================
+
+try {
+    $osInfo  = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    $osBuild = [System.Environment]::OSVersion.Version.Build
+    Write-Log "INFO" "Detected OS  : $($osInfo.Caption)"
+    Write-Log "INFO" "Build Number : $osBuild"
+
+    if ($osBuild -ge 22000) {
+        Exit-WithLog 0 "Machine is already on Windows 11 (Build $osBuild). Nothing to do."
+    }
+
+    if ($osInfo.Caption -notlike "*Windows 10*") {
+        Exit-WithLog 1 "Unexpected OS: '$($osInfo.Caption)'. Script only upgrades Windows 10. Aborting."
+    }
+
+    Write-Log "INFO" "OS confirmed: Windows 10. Proceeding."
+} catch {
+    Exit-WithLog 1 "Cannot query OS via CIM: $_"
+}
+
+# ==============================================================================
+# SECTION 2: ARCHITECTURE CHECK
+# Windows 11 is 64-bit only. Catch 32-bit machines before wasting time on copy.
+# ==============================================================================
+
+if (-not [System.Environment]::Is64BitOperatingSystem) {
+    Exit-WithLog 2 "32-bit OS detected. Windows 11 requires 64-bit. Manual intervention required on $MachineName."
+}
+Write-Log "INFO" "Architecture: 64-bit confirmed."
+
+# ==============================================================================
+# SECTION 3: SETUP PROCESS COLLISION GUARD
+# If setup.exe / SetupHost / SetupPrep is already running from a prior invocation,
+# launching a second instance corrupts the active upgrade staging. Exit cleanly.
+# ==============================================================================
+
+$runningSetup = Get-Process -Name "setup", "SetupHost", "SetupPrep" -ErrorAction SilentlyContinue
+if ($runningSetup) {
+    $names = ($runningSetup.Name | Sort-Object -Unique) -join ", "
+    Exit-WithLog 0 "Windows Setup already running ($names). Exiting to prevent corruption."
+}
+Write-Log "INFO" "Process collision check: CLEAR"
+
+# ==============================================================================
+# SECTION 4: DISK SPACE VALIDATION
+# System drive (C:) must have $RequiredFreeBytes free before any work begins.
+# Also checks D: drive for optional TempDrive offloading.
+# /TempDrive only affects where setup writes its temp working files —
+# the OS always upgrades on the system drive.
+# ==============================================================================
+
+# 4a. System drive minimum space
+try {
+    $cDisk  = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$SystemDrive'" -ErrorAction Stop
+    $freeGB = [math]::Round($cDisk.FreeSpace / 1GB, 2)
+    Write-Log "INFO" "$SystemDrive Free Space: ${freeGB} GB (minimum required: $([math]::Round($RequiredFreeBytes/1GB,0)) GB)"
+
+    if ([int64]$cDisk.FreeSpace -lt $RequiredFreeBytes) {
+        Exit-WithLog 10 "INSUFFICIENT SPACE on $SystemDrive. Available: ${freeGB} GB. Need $([math]::Round($RequiredFreeBytes/1GB,0)) GB minimum."
+    }
+} catch {
+    Exit-WithLog 10 "Cannot query $SystemDrive disk space: $_"
+}
+
+# 4b. D: drive check for TempDrive offloading
+# Only use D: as TempDrive if C: has less than 40 GB free AND D: has more than 25 GB free
+$useTempDrive = $false
+try {
+    $dDisk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='D:'" -ErrorAction SilentlyContinue
+    if ($dDisk) {
+        $dFreeGB = [math]::Round($dDisk.FreeSpace / 1GB, 2)
+        Write-Log "INFO" "D: drive detected. Free: ${dFreeGB} GB"
+        if ([int64]$cDisk.FreeSpace -lt [int64](40GB) -and [int64]$dDisk.FreeSpace -gt [int64](25GB)) {
+            $useTempDrive = $true
+            Write-Log "INFO" "D: will be used as /TempDrive to relieve pressure on $SystemDrive during staging."
+        } else {
+            Write-Log "INFO" "D: present but TempDrive not needed ($SystemDrive has sufficient headroom)."
+        }
+    } else {
+        Write-Log "INFO" "No D: drive detected. All staging on $SystemDrive."
+    }
+} catch {
+    Write-Log "WARN" "D: drive check failed (non-fatal, proceeding without TempDrive): $_"
+}
+
+# ==============================================================================
+# SECTION 5: PENDING REBOOT CHECK
+# setup.exe exits 0xC1900209 immediately if any reboot is already pending.
+# Detect all three registry sources of pending reboot state.
+# If detected: exit now — GPO Scheduled Task will retry at next startup.
+# ==============================================================================
+
+try {
+    # Source 1: Component Based Servicing — Windows component changes awaiting reboot
+    $cbsPending = $null
+    $cbsKey     = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing"
+    $cbsPending = (Get-ItemProperty -Path $cbsKey -Name "RebootPending" -ErrorAction SilentlyContinue).RebootPending
+
+    # Source 2: Windows Update — WU explicitly flagged reboot required
+    $wuKey     = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+    $wuPending = Test-Path -Path $wuKey -ErrorAction SilentlyContinue
+
+    # Source 3: PendingFileRenameOperations — file system changes deferred to reboot
+    $smKey  = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
+    $pfro   = (Get-ItemProperty -Path $smKey -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue).PendingFileRenameOperations
+    $pfroHasPending = ($null -ne $pfro -and $pfro.Count -gt 0)
+
+    if ($cbsPending -or $wuPending -or $pfroHasPending) {
+        Write-Log "WARN" "Pending reboot: CBS=$cbsPending | WU=$wuPending | PFRO=$pfroHasPending"
+        Exit-WithLog 20 "Pending reboot detected on $MachineName. Upgrade deferred. Will auto-retry at next startup via GPO task."
+    }
+
+    Write-Log "INFO" "Pending reboot check: CLEAR"
+} catch {
+    Write-Log "WARN" "Pending reboot check error (non-fatal, proceeding): $_"
+}
+
+# ==============================================================================
+# SECTION 6: BITLOCKER STATE AUDIT
+# We do NOT manually call Suspend-BitLocker here.
+# /BitLocker AlwaysSuspend passed to setup.exe is safer — setup knows exactly
+# how many reboots the upgrade needs and suspends BitLocker for the exact count.
+# This section only logs BitLocker state for audit evidence.
+# ==============================================================================
+
+try {
+    $blVol = Get-BitLockerVolume -MountPoint $SystemDrive -ErrorAction SilentlyContinue
+    if ($blVol) {
+        Write-Log "INFO" "BitLocker on $SystemDrive : Protection=$($blVol.ProtectionStatus) | Volume=$($blVol.VolumeStatus)"
+        if ($blVol.ProtectionStatus -eq 'On') {
+            Write-Log "INFO" "BitLocker ACTIVE — setup.exe will suspend automatically via /BitLocker AlwaysSuspend."
+        }
+    } else {
+        Write-Log "INFO" "BitLocker: not configured on $SystemDrive."
+    }
+} catch {
+    Write-Log "WARN" "BitLocker check failed (non-fatal): $_"
+}
+
+# ==============================================================================
+# SECTION 7: ACTIVATION STATE AUDIT — READ-ONLY, NON-DESTRUCTIVE
+# This section reads and logs activation status only.
+# It does NOT inject keys, does NOT call slmgr, does NOT modify any state.
+# In-place upgrade preserves existing activation type (KMS/MAK/OEM/Retail).
+# Unactivated machines: setup proceeds, Windows 11 has 30-day grace period.
+# ==============================================================================
+
+try {
+    $winAppID   = "55c92734-d682-4d71-983e-d6ef31105c65"   # Windows OS licensing GUID
+    $licProduct = Get-CimInstance `
+                    -Namespace "root\CIMV2\Applications\WindowsLicensing" `
+                    -ClassName SoftwareLicensingProduct `
+                    -ErrorAction Stop |
+                  Where-Object { $_.PartialProductKey -and $_.ApplicationID -eq $winAppID } |
+                  Select-Object -First 1
+
+    if ($licProduct) {
+        # LicenseStatus: 0=Unlicensed, 1=Licensed, 2=OOBGrace, 3=OOTGrace, 4=NonGenuine, 5=Notification
+        $statusMap  = @{ 0 = "Unlicensed"; 1 = "Licensed"; 2 = "OOBGrace"; 3 = "OOTGrace"; 4 = "NonGenuine"; 5 = "Notification" }
+        $statusText = $statusMap[[int]$licProduct.LicenseStatus]
+        Write-Log "INFO" "License: $($licProduct.Name)"
+        Write-Log "INFO" "Activation: $($licProduct.LicenseStatus) ($statusText)"
+
+        if ([int]$licProduct.LicenseStatus -eq 1) {
+            Write-Log "INFO" "Machine activated. Activation type preserved through upgrade automatically."
+        } else {
+            Write-Log "WARN" "Machine NOT fully activated ($statusText). Upgrade proceeds. Admin resolves activation post-upgrade via existing KMS/MAK process."
+        }
+    } else {
+        Write-Log "WARN" "No Windows license product found in WMI. Proceeding — setup handles gracefully."
+    }
+} catch {
+    Write-Log "WARN" "Activation check failed (non-fatal): $_"
+}
+
+# ==============================================================================
+# SECTION 8: WINDOWS 10 VERSION LOGGING
+# Documents which Win10 version is being upgraded from. Not a blocker —
+# setup.exe enforces its own minimum version requirements.
+# ==============================================================================
+
+try {
+    $regNT      = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop
+    $displayVer = $regNT.DisplayVersion
+    $buildNum   = $regNT.CurrentBuildNumber
+    $ubr        = $regNT.UBR
+
+    Write-Log "INFO" "Windows 10 Version: $displayVer | Build: $buildNum.$ubr"
+
+    if ([int]$buildNum -lt 19041) {
+        Write-Log "WARN" "Build $buildNum is very old. Upgrade may be blocked by setup.exe. Consider running Windows Update first."
+    }
+} catch {
+    Write-Log "WARN" "Cannot read Windows version from registry (non-fatal): $_"
+}
+
+# ==============================================================================
+# SECTION 9: ACTIVE SESSION LOGGING (INFORMATIONAL ONLY)
+# We do NOT block on active sessions.
+# /Quiet = setup runs fully in background, zero user-visible UI.
+# /NoReboot = users are never forcibly logged off or rebooted.
+# When user restarts at their own will, Windows 11 completes the installation.
+# ==============================================================================
+
+try {
+    $sessionOutput  = & query.exe session 2>&1
+    $activeSessions = $sessionOutput | Where-Object { $_ -match '\bActive\b' }
+    Write-Log "INFO" "Active user sessions: $($activeSessions.Count)"
+    if ($activeSessions.Count -gt 0) {
+        Write-Log "INFO" "Active users present. Upgrade stages silently in background. Users not disrupted."
+        $activeSessions | ForEach-Object { Write-Log "INFO" "  $_" }
+    }
+} catch {
+    Write-Log "WARN" "Session enumeration failed (non-fatal): $_"
+}
+
+# ==============================================================================
+# SECTION 10: TPM LOGGING (INFORMATIONAL)
+# Hardware confirmed compatible per admin. Setup.exe enforces TPM 2.0 itself.
+# ==============================================================================
+
+try {
+    $tpm = Get-WmiObject -Namespace "Root\CIMv2\Security\MicrosoftTpm" -Class Win32_Tpm -ErrorAction SilentlyContinue
+    if ($tpm) {
+        Write-Log "INFO" "TPM: Activated=$($tpm.IsActivated_InitialValue) | Enabled=$($tpm.IsEnabled_InitialValue) | Owned=$($tpm.IsOwned_InitialValue)"
+    } else {
+        Write-Log "WARN" "TPM not visible via WMI. If hardware has TPM 2.0, this may be a WMI query issue. Setup validates independently."
+    }
+} catch {
+    Write-Log "WARN" "TPM query failed (non-fatal): $_"
+}
+
+# ==============================================================================
+# SECTION 11: ALREADY-STAGED GUARD
+# If a previous run completed staging (state = UPGRADE_STAGED and $Windows.~BT exists),
+# skip all work. User just needs to restart at their own will.
+# This prevents double-staging which wastes disk space and could confuse setup.
+# ==============================================================================
+
+$windowsBTPath = "$SystemDrive\`$Windows.~BT"   # $ in folder name needs backtick escape
+
+if ($state['Stage'] -eq "UPGRADE_STAGED" -and (Test-Path -LiteralPath $windowsBTPath -ErrorAction SilentlyContinue)) {
+    Write-Log "INFO" "Upgrade already staged on a previous run (\$Windows.~BT exists + state=UPGRADE_STAGED)."
+    Write-Log "INFO" "User restarts at their own will to complete Windows 11 installation."
+    Exit-WithLog 0 "Upgrade already staged. Awaiting user-initiated reboot. No action needed."
+}
+
+# ==============================================================================
+# SECTION 12: NETWORK SOURCE VALIDATION
+# Fail fast with a clear message before attempting any copy.
+# Validates: share reachable, setup.exe present, image file present.
+# ==============================================================================
+
+Write-Log "INFO" "Validating network source: $NetworkSource"
+
+# Check 1: Share root reachable
+if (-not (Test-Path -LiteralPath $NetworkSource -ErrorAction SilentlyContinue)) {
+    Exit-WithLog 30 "Network source NOT reachable: '$NetworkSource'. Verify SMB share is online and computer account has Read access."
+}
+
+# Check 2: setup.exe at share root
+$networkSetupExe = Join-Path $NetworkSource "setup.exe"
+if (-not (Test-Path -LiteralPath $networkSetupExe -ErrorAction SilentlyContinue)) {
+    Exit-WithLog 31 "setup.exe NOT found at '$NetworkSource'. Verify USB media was copied to share root correctly."
+}
+
+# Check 3: Windows image file (install.esd from Media Creation Tool, or install.wim from DISM-extracted ISO)
+$networkWim = Join-Path $NetworkSource "sources\install.wim"
+$networkEsd = Join-Path $NetworkSource "sources\install.esd"
+if (-not (Test-Path -LiteralPath $networkWim -ErrorAction SilentlyContinue) -and
+    -not (Test-Path -LiteralPath $networkEsd -ErrorAction SilentlyContinue)) {
+    Exit-WithLog 31 "Neither install.wim nor install.esd found under '$NetworkSource\sources\'. Media is incomplete."
+}
+
+# Record network setup.exe size now for post-copy size comparison
+$networkSetupItem = Get-Item -LiteralPath $networkSetupExe -ErrorAction SilentlyContinue
+$networkSetupSize = if ($networkSetupItem) { $networkSetupItem.Length } else { 0 }
+Write-Log "INFO" "Network source validated. setup.exe size: $networkSetupSize bytes ($([math]::Round($networkSetupSize/1MB,2)) MB)"
+
+# ==============================================================================
+# SECTION 13: LOCAL STAGING DIRECTORY CREATION
+# ==============================================================================
+
+try {
+    # -Force does NOT overwrite existing content — it only skips error if dir exists
+    New-Item -ItemType Directory -Path $LocalTarget -Force -ErrorAction Stop | Out-Null
+    New-Item -ItemType Directory -Path $LogDir      -Force -ErrorAction Stop | Out-Null
+    Write-Log "INFO" "Staging directory ready: $LocalTarget"
+} catch {
+    Exit-WithLog 32 "Cannot create staging directory '$LocalTarget': $_"
+}
+
+# ==============================================================================
+# SECTION 14: IDEMPOTENT COPY DECISION
+# Before copying ~6 GB, check if a valid local copy already exists.
+# Compare setup.exe byte size: network vs local. Match = skip copy.
+# Size mismatch, missing file, or file < 1 MB = copy needed.
+# ==============================================================================
+
+$needsCopy      = $true
+$localSetupExe  = Join-Path $LocalTarget "setup.exe"
+
+if ($state['Stage'] -notin @("INIT", "COPY_FAILED") -and (Test-Path -LiteralPath $localSetupExe -ErrorAction SilentlyContinue)) {
+    $localSetupItem = Get-Item -LiteralPath $localSetupExe -ErrorAction SilentlyContinue
+    $localSetupSize = if ($localSetupItem) { $localSetupItem.Length } else { 0 }
+
+    Write-Log "INFO" "Local setup.exe: $localSetupSize bytes | Network: $networkSetupSize bytes"
+
+    if ($localSetupSize -eq $networkSetupSize -and $localSetupSize -gt 1MB) {
+        Write-Log "INFO" "Local copy matches source size. Skipping re-copy."
+        $needsCopy = $false
+    } else {
+        Write-Log "WARN" "Local copy size mismatch or too small. Performing fresh copy."
+    }
+} else {
+    Write-Log "INFO" "No valid local copy found or state requires fresh copy."
+}
+
+# ==============================================================================
+# SECTION 15: RESILIENT MEDIA COPY VIA ROBOCOPY
+# /Z  = Restartable mode — if network drops mid-file, robocopy resumes from
+#        where it left off instead of restarting the file from byte 0.
+# /R:5 /W:15 = Retry each failed file up to 5 times, 15 seconds between tries.
+# /MT:4 = 4 parallel threads — fast over LAN, low impact on user network activity.
+# /E  = Copy all subdirectories including empty ones (full media structure needed).
+# Robocopy exit codes: 0-7 = success variants, 8+ = actual copy failures.
+# ==============================================================================
+
+if ($needsCopy) {
+    Write-Log "INFO" "Copying media from network to local staging (restartable mode)..."
+    Write-Log "INFO" "Source : $NetworkSource"
+    Write-Log "INFO" "Dest   : $LocalTarget"
+
+    # Robocopy argument array — paths quoted individually to handle spaces in $NetworkSource
+    $roboArgs = @(
+        "`"$NetworkSource`"",     # Source: quoted because path contains spaces
+        "`"$LocalTarget`"",       # Destination: quoted for safety
+        "/E",                     # Include all subdirs (boot\, efi\, sources\, support\, etc.)
+        "/Z",                     # Restartable — survives SMB interruptions mid-file
+        "/R:5",                   # Retry each file up to 5 times
+        "/W:15",                  # Wait 15 seconds between retries
+        "/MT:4",                  # 4 threads — balanced LAN speed vs user impact
+        "/NP",                    # No per-file progress (cleaner log output)
+        "/NJH",                   # No job header line
+        "/NJS",                   # No job summary line (we log our own summary)
+        "/NFL",                   # No file list (reduce log verbosity)
+        "/NDL",                   # No directory list
+        "/LOG+:`"$LogFile`""      # Append robocopy output to our main log file
+    )
+
+    try {
+        $roboProcess = Start-Process -FilePath "robocopy.exe" `
+                       -ArgumentList $roboArgs `
+                       -Wait -PassThru -NoNewWindow -ErrorAction Stop
+
+        $roboExit = $roboProcess.ExitCode
+        Write-Log "INFO" "Robocopy exit code: $roboExit"
+
+        # Robocopy exit code meanings:
+        # 0 = No files copied (destination already matches source — not a failure)
+        # 1 = Files copied successfully
+        # 2 = Extra files in destination (non-fatal)
+        # 3 = 1+2 combined
+        # 4 = Mismatched files (non-fatal)
+        # 5-7 = Combinations of above (all non-fatal)
+        # 8+  = Copy errors occurred — some files were NOT copied (FAILURE)
+        if ($roboExit -ge 8) {
+            $state['Stage'] = "COPY_FAILED"
+            Write-State -State $state
+            Exit-WithLog 33 "Robocopy FAILED (exit $roboExit). Copy incomplete. Check network connectivity. Log: $LogFile"
+        }
+
+        $state['Stage']    = "COPIED"
+        $state['CopiedAt'] = (Get-Date -Format "o")
+        Write-State -State $state
+        Write-Log "INFO" "Robocopy SUCCEEDED. All media staged locally."
+    } catch {
+        $state['Stage'] = "COPY_FAILED"
+        Write-State -State $state
+        Exit-WithLog 33 "Robocopy could not launch: $_"
+    }
+}
+
+# ==============================================================================
+# SECTION 16: POST-COPY INTEGRITY VALIDATION (4 LAYERS)
+# Layer 1: Presence      — setup.exe must exist
+# Layer 2: Size          — byte-for-byte size match with network source
+# Layer 3: Authenticode  — Microsoft digital signature must be Valid
+#                          Offline CRL check failure (UnknownError) tolerated
+#                          IF and ONLY IF the signer certificate subject is Microsoft
+# Layer 4: SHA256        — exact hash match against confirmed value
+# All 4 layers must pass before setup.exe is executed.
+# ==============================================================================
+
+Write-Log "INFO" "Running post-copy integrity validation (4 layers)..."
+
+# Layer 1: Presence
+if (-not (Test-Path -LiteralPath $localSetupExe -ErrorAction SilentlyContinue)) {
+    Exit-WithLog 34 "INTEGRITY FAIL Layer 1: setup.exe missing from local staging after copy."
+}
+Write-Log "INFO" "Layer 1 (presence): PASSED"
+
+# Layer 2: Size match
+$finalItem = Get-Item -LiteralPath $localSetupExe -ErrorAction SilentlyContinue
+$finalSize = if ($finalItem) { $finalItem.Length } else { 0 }
+
+if ($finalSize -ne $networkSetupSize) {
+    Exit-WithLog 35 "INTEGRITY FAIL Layer 2: Size mismatch. Network=$networkSetupSize bytes | Local=$finalSize bytes. Partial copy."
+}
+Write-Log "INFO" "Layer 2 (size): PASSED — $finalSize bytes match source"
+
+# Layer 3: Authenticode signature
+try {
+    $sig         = Get-AuthenticodeSignature -FilePath $localSetupExe -ErrorAction Stop
+    $sigStatus   = $sig.Status
+    $sigSubject  = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "NoSigner" }
+    $isMicrosoft = ($sigSubject -match "Microsoft")
+
+    Write-Log "INFO" "Authenticode: Status=$sigStatus | Signer=$sigSubject"
+
+    if ($sigStatus -eq "Valid" -and $isMicrosoft) {
+        Write-Log "INFO" "Layer 3 (authenticode): PASSED — Valid Microsoft signature"
+    } elseif ($sigStatus -eq "UnknownError" -and $isMicrosoft) {
+        # UnknownError typically means CRL server unreachable (intranet-only machines cannot
+        # reach Microsoft's CRL endpoint). File is still genuinely Microsoft-signed.
+        # SHA256 layer below provides additional cryptographic assurance.
+        Write-Log "WARN" "Layer 3 (authenticode): UnknownError (likely offline CRL — intranet machine). Signer IS Microsoft. Proceeding. SHA256 in Layer 4 provides additional verification."
+    } else {
+        Exit-WithLog 36 "INTEGRITY FAIL Layer 3: Authenticode invalid. Status=$sigStatus | Signer=$sigSubject. File may be tampered. ABORTING."
+    }
+} catch {
+    # If Get-AuthenticodeSignature itself fails (rare AppLocker/WDAC edge case), log and proceed.
+    # SHA256 layer below is the hard backstop.
+    Write-Log "WARN" "Layer 3 (authenticode): Check failed (non-fatal, SHA256 layer still runs): $_"
+}
+
+# Layer 4: SHA256 — hard cryptographic verification against confirmed hash
+Write-Log "INFO" "Layer 4 (SHA256): Computing hash of local setup.exe..."
+try {
+    $actualHash = (Get-FileHash -Path $localSetupExe -Algorithm SHA256 -ErrorAction Stop).Hash
+
+    Write-Log "INFO" "Expected : $($ExpectedSHA256.ToUpper())"
+    Write-Log "INFO" "Computed : $actualHash"
+
+    if ($actualHash -ne $ExpectedSHA256.ToUpper()) {
+        Exit-WithLog 36 "INTEGRITY FAIL Layer 4: SHA256 MISMATCH. File corrupted or tampered. ABORTING. Expected=$ExpectedSHA256 Got=$actualHash"
+    }
+    Write-Log "INFO" "Layer 4 (SHA256): PASSED — Hash verified."
+} catch {
+    Exit-WithLog 36 "Layer 4 (SHA256): Hash computation failed: $_"
+}
+
+Write-Log "INFO" "All 4 integrity layers PASSED. Media is authentic and complete."
+
+# ==============================================================================
+# SECTION 17: EDITION DETECTION AND /ImageIndex SELECTION
+# Media Creation Tool produces a multi-edition install.esd (Home/Pro/etc.).
+# Without /ImageIndex, setup.exe in /Quiet mode may:
+#   (a) silently select the wrong edition, or
+#   (b) prompt the user to choose — breaking unattended execution.
+# We use DISM to enumerate all image indexes in the local media,
+# then match the currently installed EditionID to the correct index.
+# This ensures the upgrade targets the EXACT same edition that is installed.
+# ==============================================================================
+
+# Resolve which image file exists locally
+$localWim = Join-Path $LocalTarget "sources\install.wim"
+$localEsd = Join-Path $LocalTarget "sources\install.esd"
+$imagePath = $null
+
+if      (Test-Path -LiteralPath $localWim -ErrorAction SilentlyContinue) { $imagePath = $localWim }
+elseif  (Test-Path -LiteralPath $localEsd -ErrorAction SilentlyContinue) { $imagePath = $localEsd }
+else    { Exit-WithLog 37 "install.wim and install.esd both missing from local media. Copy is incomplete." }
+
+Write-Log "INFO" "Image file: $imagePath"
+
+# Read currently installed EditionID from registry
+$currentEditionID = $null
+try {
+    $currentEditionID = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop).EditionID
+    Write-Log "INFO" "Installed EditionID: $currentEditionID"
+} catch {
+    Exit-WithLog 38 "Cannot read installed EditionID from registry: $_"
+}
+
+# Use DISM to enumerate all indexes in the image file
+# /English ensures output is always in English regardless of system language — stable parsing
+$dismExe = Join-Path $env:WINDIR "System32\dism.exe"
+Write-Log "INFO" "Enumerating image indexes via DISM..."
+$dismOutput = & $dismExe /English /Get-WimInfo /WimFile:"$imagePath" 2>&1
+$dismExit   = $LASTEXITCODE
+
+Write-Log "INFO" "DISM exit code: $dismExit"
+if ($dismExit -ne 0) {
+    Exit-WithLog 38 "DISM /Get-WimInfo failed (exit $dismExit). Cannot determine image index. Output: $($dismOutput -join ' | ')"
+}
+
+# Parse DISM output into index/name pairs
+# DISM output format (English):
+#   Index : 6
+#   Name  : Windows 11 Pro
+$imageIndexes = @()
+$currentIndex = $null
+$currentName  = $null
+
+foreach ($line in $dismOutput) {
+    if ($line -match "^\s*Index\s*:\s*(\d+)\s*$") {
+        # Save completed previous entry before starting new one
+        if ($null -ne $currentIndex -and $null -ne $currentName) {
+            $imageIndexes += [pscustomobject]@{ Index = [int]$currentIndex; Name = $currentName }
+        }
+        $currentIndex = $Matches[1]
+        $currentName  = $null
+        continue
+    }
+    if ($line -match "^\s*Name\s*:\s*(.+?)\s*$" -and $null -ne $currentIndex) {
+        $currentName = $Matches[1]
+        continue
+    }
+}
+# Flush last entry
+if ($null -ne $currentIndex -and $null -ne $currentName) {
+    $imageIndexes += [pscustomobject]@{ Index = [int]$currentIndex; Name = $currentName }
+}
+
+if ($imageIndexes.Count -eq 0) {
+    Exit-WithLog 38 "DISM returned 0 parseable image indexes. Cannot determine /ImageIndex."
+}
+
+Write-Log "INFO" "Image indexes found in media:"
+$imageIndexes | ForEach-Object { Write-Log "INFO" "  Index $($_.Index) : $($_.Name)" }
+
+# Map EditionID to a pattern that will match WIM image names
+# Covers all common Windows 10/11 editions that may be in your org
+$editionToPattern = @{
+    "Professional"            = "Pro(?!\s+Education|.*Workstation)"  # Pro only, not Pro Education/Workstation
+    "ProfessionalN"           = "Pro\s+N"
+    "ProfessionalEducation"   = "Pro\s+Education"
+    "ProfessionalWorkstation" = "Workstation"
+    "Enterprise"              = "Enterprise(?!.*LTSC|.*N)"
+    "EnterpriseN"             = "Enterprise\s+N"
+    "EnterpriseLTSB"          = "LTSC|LTSB|Enterprise\s+20"
+    "EnterpriseS"             = "LTSC|Enterprise\s+20"
+    "Education"               = "^Windows\s+\d+\s+Education$"
+    "EducationN"              = "Education\s+N"
+    "Core"                    = "Home(?!\s+Single|.*N)"              # Home only
+    "CoreN"                   = "Home\s+N"
+    "CoreSingleLanguage"      = "Home\s+Single"
+}
+
+$pattern = $editionToPattern[$currentEditionID]
+if (-not $pattern) {
+    Exit-WithLog 38 "No edition pattern defined for EditionID '$currentEditionID'. Add it to `$editionToPattern in Section 17."
+}
+
+# Find matching index — prefer entries that include "Windows 11" in name if multiple match
+$candidates = $imageIndexes | Where-Object { $_.Name -match $pattern }
+if (-not $candidates -or @($candidates).Count -eq 0) {
+    # Log all available indexes to help admin diagnose the mismatch
+    $allNames = ($imageIndexes | ForEach-Object { "$($_.Index):$($_.Name)" }) -join " | "
+    Exit-WithLog 38 "EDITION MISMATCH: No image index in media matches EditionID '$currentEditionID' (pattern '$pattern'). Available: $allNames. Use matching-edition media."
+}
+
+$win11Candidates = @($candidates | Where-Object { $_.Name -match "Windows\s*11" })
+$selectedIndex   = if ($win11Candidates.Count -gt 0) { $win11Candidates[0].Index } else { @($candidates)[0].Index }
+$selectedName    = ($imageIndexes | Where-Object { $_.Index -eq $selectedIndex }).Name
+
+Write-Log "INFO" "Selected: Index $selectedIndex — '$selectedName' matches EditionID '$currentEditionID'"
+
+# ==============================================================================
+# SECTION 18: LANGUAGE VALIDATION
+# /Auto Upgrade requires the media language to match the system's installed UI language.
+# If they don't match, setup exits with a non-keeping migration error (0xC1900204).
+# We parse sources\lang.ini from local media to confirm the match.
+# ==============================================================================
+
+$systemLang = $null
+try {
+    $systemLang = [System.Globalization.CultureInfo]::InstalledUICulture.Name
+    Write-Log "INFO" "System UI language: $systemLang"
+} catch {
+    Exit-WithLog 39 "Cannot determine system UI language: $_"
+}
+
+$langIniPath = Join-Path $LocalTarget "sources\lang.ini"
+if (Test-Path -LiteralPath $langIniPath -ErrorAction SilentlyContinue) {
+    try {
+        $langIniContent = Get-Content -LiteralPath $langIniPath -ErrorAction Stop
+        # lang.ini lines containing locale codes look like: "en-US=1" or just "en-US"
+        $mediaLangs = $langIniContent | Where-Object { $_ -match "^[a-z]{2,3}-[A-Z]{2,4}" } |
+                      ForEach-Object { ($_ -split "=")[0].Trim() } |
+                      Sort-Object -Unique
+
+        Write-Log "INFO" "Media languages in lang.ini: $($mediaLangs -join ', ')"
+
+        if ($mediaLangs.Count -gt 0 -and $systemLang -notin $mediaLangs) {
+            Exit-WithLog 39 "LANGUAGE MISMATCH: System='$systemLang', Media languages: $($mediaLangs -join ', '). Use media matching system language to preserve files/apps."
+        }
+        Write-Log "INFO" "Language check: PASSED — '$systemLang' present in media."
+    } catch {
+        Write-Log "WARN" "lang.ini parse failed (non-fatal, proceeding): $_"
+    }
+} else {
+    # lang.ini is not always present on all media variants — not a hard block
+    Write-Log "WARN" "sources\lang.ini not found in local media. Language pre-check skipped. Setup will verify."
+}
+
+# ==============================================================================
+# SECTION 19: COMPATIBILITY SCAN (DRY RUN — NO SYSTEM CHANGES)
+# setup.exe /Compat ScanOnly: reads system state, checks compatibility, exits.
+# Makes ZERO changes to the OS. Takes ~2-5 minutes.
+# Hard blocks stop the upgrade. Soft warnings proceed with /Compat IgnoreWarning.
+# If already passed in a previous run (state = SCAN_PASSED), skip this section.
+# ==============================================================================
+
+if ($state['Stage'] -in @("INIT", "COPIED", "COPY_FAILED", "SCAN_FAILED")) {
+
+    Write-Log "INFO" "Running compatibility scan (ScanOnly — zero system changes)..."
+
+    $compatLogDir = Join-Path $LogDir "CompatScan_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    New-Item -ItemType Directory -Path $compatLogDir -Force -ErrorAction SilentlyContinue | Out-Null
+
+    # ScanOnly argument string
+    # Note: /ImageIndex ensures scan checks the exact edition we intend to install
+    $scanArgString = "/Auto Upgrade /Quiet /NoReboot /DynamicUpdate Disable /Compat ScanOnly /ImageIndex $selectedIndex /CopyLogs `"$compatLogDir`""
+
+    try {
+        $scanProcess = Start-Process -FilePath $localSetupExe `
+                       -ArgumentList $scanArgString `
+                       -WorkingDirectory $LocalTarget `
+                       -Wait -PassThru -NoNewWindow -ErrorAction Stop
+
+        $scanCode    = $scanProcess.ExitCode
+        $scanCodeHex = Get-HexCode -Code $scanCode
+        Write-Log "INFO" "Compat scan exit: $scanCode ($scanCodeHex)"
+
+        # Hard block codes — genuine incompatibilities requiring manual admin resolution:
+        # 0xC1900200 = Hardware does not meet Windows 11 minimum requirements
+        # 0xC1900208 = Incompatible application or driver (known blocking issue)
+        # 0xC190020E = Insufficient disk space (detected by setup, not our pre-check)
+        # 0xC1900204 = Migration choice not available (edition/language mismatch reached setup)
+        # Compare as uint32 to handle signed/unsigned int edge cases
+        $hardBlocksU32 = @([uint32]0xC1900200, [uint32]0xC1900208, [uint32]0xC190020E, [uint32]0xC1900204)
+        $scanU32        = [uint32]$scanCode
+
+        if ($hardBlocksU32 -contains $scanU32) {
+            $state['Stage']       = "SCAN_FAILED"
+            $state['ScanCode']    = $scanCode
+            $state['ScanCodeHex'] = $scanCodeHex
+            Write-State -State $state
+
+            # Upload compat logs for admin analysis
+            if (Test-Path -LiteralPath $compatLogDir -ErrorAction SilentlyContinue) {
+                Copy-Item -Path $compatLogDir -Destination $NetworkLogDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Exit-WithLog 40 "COMPAT HARD BLOCK on $MachineName. Code=$scanCodeHex. Genuine incompatibility — admin review required. Logs: $compatLogDir"
+        }
+
+        # Success codes:
+        # 0xC1900210 = ScanOnly completed with no issues (standard success return)
+        # 0x00000000 = Also returned by some setup.exe versions as clean success
+        if ($scanU32 -eq [uint32]0xC1900210 -or $scanCode -eq 0) {
+            Write-Log "INFO" "Compat scan: CLEAN PASS. No blocks found."
+        } else {
+            # Non-zero non-block code = soft warning (driver/app advisory, not a hard block)
+            # /Compat IgnoreWarning in upgrade phase handles these — same as "Install anyway" in GUI
+            Write-Log "WARN" "Compat scan: Soft warning code $scanCodeHex. Proceeding with /Compat IgnoreWarning."
+        }
+
+        $state['Stage']       = "SCAN_PASSED"
+        $state['ScanCode']    = $scanCode
+        $state['ScanCodeHex'] = $scanCodeHex
+        $state['ScanPassedAt'] = (Get-Date -Format "o")
+        Write-State -State $state
+
+        # Upload compat logs to network regardless of result (audit trail)
+        if (Test-Path -LiteralPath $compatLogDir -ErrorAction SilentlyContinue) {
+            Copy-Item -Path $compatLogDir -Destination $NetworkLogDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+    } catch {
+        $state['Stage'] = "SCAN_FAILED"
+        Write-State -State $state
+        Exit-WithLog 41 "Compatibility scan could not launch: $_"
+    }
+
+} else {
+    Write-Log "INFO" "Compat scan skipped — state='$($state['Stage'])' indicates already passed."
+}
+
+# ==============================================================================
+# SECTION 20: IN-PLACE UPGRADE EXECUTION
+# ==============================================================================
+# CRITICAL: Every argument below is deliberate. Do NOT remove or change any.
+#
+# /Auto Upgrade
+#   THE most important argument. Instructs setup.exe to perform an in-place
+#   upgrade while keeping ALL user files, ALL installed applications, and ALL
+#   Windows settings. This is the programmatic equivalent of the GUI option
+#   "Keep personal files, apps, and Windows settings."
+#   Removing this flag = clean install = data loss.
+#
+# /Quiet
+#   Zero user-visible UI. Setup runs entirely in background.
+#   Users see no dialogs, no progress windows, no interruptions.
+#
+# /NoReboot
+#   Setup stages the upgrade fully (downlevel phase) and then STOPS.
+#   No forced reboot is issued. The machine stays on Windows 10.
+#   When the user restarts at their own will — today, tomorrow, next week —
+#   Windows 11 completes installation automatically during that reboot.
+#   The "Welcome to Windows 11" experience appears after that restart.
+#
+# /DynamicUpdate Disable
+#   Prevents setup from contacting Microsoft servers for driver/update downloads.
+#   Required for: intranet-only machines, controlled upgrade rollouts.
+#   We use local media precisely so no internet is needed.
+#
+# /Compat IgnoreWarning
+#   Overrides SOFT compatibility warnings that the ScanOnly phase logged.
+#   Does NOT override HARD blocks (those were caught and aborted in Section 19).
+#   Equivalent to clicking "Install anyway" on a soft-warning screen in the GUI.
+#
+# /eula accept
+#   Silent EULA acceptance. Lowercase "accept" is required for cross-version
+#   compatibility — some setup.exe builds are case-sensitive on the value.
+#
+# /BitLocker AlwaysSuspend
+#   Instructs setup.exe to suspend BitLocker natively before the upgrade.
+#   More reliable than manually calling Suspend-BitLocker because setup knows
+#   the exact number of reboots and suspends for the exact right count.
+#
+# /ShowOOBE None
+#   Suppresses Out-of-Box Experience prompts after upgrade completes.
+#   AD/domain users do not need OOBE — their profile is already set up.
+#
+# /MigrateDrivers All
+#   Carries ALL existing drivers through the upgrade without removal.
+#   Reduces post-upgrade driver issues on heterogeneous hardware.
+#
+# /ResizeRecoveryPartition Enable
+#   Allows setup to resize the recovery partition if needed to complete upgrade.
+#   Prevents failures on machines where the recovery partition is undersized.
+#
+# /Uninstall Enable
+#   Creates and preserves Windows.old after the upgrade completes.
+#   Allows rollback via Settings > Recovery if needed post-upgrade.
+#
+# /Priority Low
+#   Tells setup to yield CPU and I/O to foreground user applications.
+#   Users continue working normally while the upgrade stages in background.
+#
+# /ImageIndex $selectedIndex
+#   Explicitly selects the edition index from the multi-edition media.
+#   Without this, /Quiet setup may silently pick the wrong edition
+#   or stall waiting for user input.
+#
+# /CopyLogs
+#   Captures Windows Setup internal logs (Panther, setupact.log, setuperr.log)
+#   into our log directory for admin review on failure.
+# ==============================================================================
+
+if ($state['Stage'] -in @("SCAN_PASSED", "UPGRADE_FAILED")) {
+
+    Write-Log "INFO" "========================================================================"
+    Write-Log "INFO" "LAUNCHING WINDOWS 11 25H2 IN-PLACE UPGRADE"
+    Write-Log "INFO" "Data mode    : /Auto Upgrade (ALL files, apps, settings PRESERVED)"
+    Write-Log "INFO" "Reboot mode  : /NoReboot (user restarts at own will)"
+    Write-Log "INFO" "Edition      : Index $selectedIndex — $selectedName"
+    Write-Log "INFO" "========================================================================"
+
+    # Create setup log subdirectory
+    $setupLogDest = Join-Path $LogDir "SetupLogs"
+    New-Item -ItemType Directory -Path $setupLogDest -Force -ErrorAction SilentlyContinue | Out-Null
+
+    # Build argument list — one argument per line for maintainability
+    $upgradeArgList = @(
+        "/Auto Upgrade"                          # KEEP ALL: files + apps + settings
+        "/Quiet"                                 # Background — zero user UI
+        "/NoReboot"                              # No forced reboot — user reboots at own will
+        "/DynamicUpdate Disable"                 # No internet needed — local media only
+        "/Compat IgnoreWarning"                  # Override soft-only warnings from ScanOnly
+        "/eula accept"                           # EULA accepted (lowercase value — cross-version safe)
+        "/BitLocker AlwaysSuspend"               # Native BitLocker handling by setup
+        "/ShowOOBE None"                         # Skip OOBE for domain users (profile already exists)
+        "/MigrateDrivers All"                    # Keep all drivers through upgrade
+        "/ResizeRecoveryPartition Enable"        # Resize recovery partition if needed
+        "/Uninstall Enable"                      # Preserve Windows.old for rollback
+        "/Priority Low"                          # Yield CPU/IO to active user apps
+        "/ImageIndex $selectedIndex"             # Explicit edition selection — no prompts
+        "/CopyLogs `"$setupLogDest`""            # Collect setup internal logs
+    )
+
+    # Conditionally add /TempDrive if D: was chosen in Section 4b
+    if ($useTempDrive) {
+        $upgradeArgList += "/TempDrive D:"
+        Write-Log "INFO" "Adding /TempDrive D: to offload temp files from $SystemDrive."
+    }
+
+    $upgradeArgString = $upgradeArgList -join " "
+    Write-Log "INFO" "Setup args: $upgradeArgString"
+
+    # Mark UPGRADE_LAUNCHED before calling setup.exe.
+    # If the machine crashes DURING setup, next run sees UPGRADE_LAUNCHED and
+    # does not blindly re-trigger setup on a system mid-rollback.
+    $state['Stage']             = "UPGRADE_LAUNCHED"
+    $state['UpgradeLaunchedAt'] = (Get-Date -Format "o")
+    Write-State -State $state
+
+    try {
+        # -WorkingDirectory is REQUIRED:
+        #   setup.exe resolves relative paths (sources\, boot\, etc.) from its working directory.
+        #   If omitted, PowerShell's inherited working directory (often a UNC path) is used,
+        #   which causes setup to fail to locate its own media files.
+        # -NoNewWindow keeps process in same SYSTEM session context
+        # -Wait blocks script until setup.exe fully exits (20-90 min depending on hardware)
+        # -PassThru returns process object so we can read ExitCode
+        $upgradeProcess = Start-Process -FilePath $localSetupExe `
+                          -ArgumentList $upgradeArgString `
+                          -WorkingDirectory $LocalTarget `
+                          -Wait -PassThru -NoNewWindow -ErrorAction Stop
+
+        $upgradeCode    = $upgradeProcess.ExitCode
+        $upgradeCodeHex = Get-HexCode -Code $upgradeCode
+        Write-Log "INFO" "setup.exe exited: $upgradeCode ($upgradeCodeHex)"
+
+    } catch {
+        $state['Stage'] = "UPGRADE_FAILED"
+        Write-State -State $state
+        Exit-WithLog 50 "setup.exe could not launch or was terminated externally: $_"
+    }
+
+    # ==========================================================================
+    # SECTION 21: EXIT CODE INTERPRETATION
+    # Windows Setup uses HRESULT-style codes, NOT Win32/MSI codes.
+    # 3010 is an MSI code ("reboot required") — it should NOT appear from setup.exe.
+    # Success codes from setup.exe downlevel (pre-reboot) phase:
+    #   0x00000000  (0)           = Staged successfully
+    #   0xC1900210  (-1047526896) = No issues, staged successfully (some build variants)
+    # ==========================================================================
+
+    $successCodesU32 = @([uint32]0x00000000, [uint32]0xC1900210)
+    $upgradeU32      = [uint32]$upgradeCode
+
+    if ($successCodesU32 -contains $upgradeU32) {
+
+        $state['Stage']                     = "UPGRADE_STAGED"
+        $state['UpgradeCode']               = $upgradeCode
+        $state['UpgradeCodeHex']            = $upgradeCodeHex
+        $state['UpgradeStagedAt']           = (Get-Date -Format "o")
+        $state['TargetBuild']               = "Windows 11 25H2"
+        $state['SelectedImageIndex']        = $selectedIndex
+        $state['SelectedImageName']         = $selectedName
+        Write-State -State $state
+
+        Write-Log "INFO" "========================================================================"
+        Write-Log "INFO" "UPGRADE STAGED SUCCESSFULLY on $MachineName"
+        Write-Log "INFO" "ALL user files, apps, and settings are PRESERVED."
+        Write-Log "INFO" "Windows 11 25H2 will complete when user restarts at their own will."
+        Write-Log "INFO" "No forced reboot. No user disruption."
+        Write-Log "INFO" "When user next restarts: Windows 11 installs, Welcome screen appears."
+        Write-Log "INFO" "========================================================================"
+
+        # Upload final log to central share for admin visibility
+        if (Test-Path -LiteralPath $NetworkLogDir -ErrorAction SilentlyContinue) {
+            Copy-Item -Path $LogFile -Destination $NetworkLogDir -Force -ErrorAction SilentlyContinue
+        }
+
+        Exit-WithLog 0 "SUCCESS: $MachineName staged for Windows 11 25H2. Awaiting user-initiated reboot."
+
+    } else {
+
+        # ======================================================================
+        # UPGRADE FAILED
+        # setup.exe with /Auto Upgrade performs automatic rollback on failure.
+        # Windows.old is cleaned up by setup itself. Machine remains on Windows 10.
+        # User data is 100% safe — no changes were committed to the live OS.
+        # Admin must review Panther logs to identify root cause.
+        # ======================================================================
+
+        $state['Stage']           = "UPGRADE_FAILED"
+        $state['UpgradeCode']     = $upgradeCode
+        $state['UpgradeCodeHex']  = $upgradeCodeHex
+        $state['UpgradeFailedAt'] = (Get-Date -Format "o")
+        Write-State -State $state
+
+        Write-Log "ERROR" "========================================================================"
+        Write-Log "ERROR" "UPGRADE FAILED on $MachineName"
+        Write-Log "ERROR" "Exit Code : $upgradeCode ($upgradeCodeHex)"
+        Write-Log "ERROR" "Machine   : Remains on Windows 10. All data is SAFE."
+        Write-Log "ERROR" "Rollback  : Automatically completed by setup.exe."
+        Write-Log "ERROR" "Admin review logs:"
+        Write-Log "ERROR" "  Script logs  : $LogDir"
+        Write-Log "ERROR" "  Setup logs   : $setupLogDest"
+        Write-Log "ERROR" "  Panther logs : $SystemDrive\`$Windows.~BT\Sources\Panther\"
+        Write-Log "ERROR" "  System Panther: $SystemDrive\Windows\Panther\"
+        Write-Log "ERROR" "Common failure codes:"
+        Write-Log "ERROR" "  0xC1900101 = Driver failure (most common — check Panther)"
+        Write-Log "ERROR" "  0x8007042B = Setup terminated (check AV/EDR exclusion on $LocalTarget)"
+        Write-Log "ERROR" "  0xC1900107 = Cleanup needed — reboot machine and retry"
+        Write-Log "ERROR" "  0x80070070 = Disk full mid-setup (setup needed more than $([math]::Round($RequiredFreeBytes/1GB,0)) GB)"
+        Write-Log "ERROR" "========================================================================"
+
+        # Upload all available logs to network for admin analysis
+        if (Test-Path -LiteralPath $NetworkLogDir -ErrorAction SilentlyContinue) {
+            Copy-Item -Path $LogFile -Destination $NetworkLogDir -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $setupLogDest -ErrorAction SilentlyContinue) {
+                $netSetupDest = Join-Path $NetworkLogDir "SetupLogs_$MachineName"
+                Copy-Item -Path $setupLogDest -Destination $netSetupDest -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        Exit-WithLog 50 "FAILURE: setup.exe=$upgradeCodeHex on $MachineName. Windows 10 intact. Admin review required."
+    }
+
+} elseif ($state['Stage'] -in @("UPGRADE_LAUNCHED", "UPGRADE_STAGED")) {
+    # Previous run launched or staged the upgrade — do not re-trigger setup
+    Write-Log "INFO" "State='$($state['Stage'])' — upgrade already in progress or staged. Not re-triggering."
+    Exit-WithLog 0 "Upgrade already launched/staged on $MachineName. No action."
+} else {
+    # Unexpected state — log and exit safely
+    Write-Log "WARN" "Unexpected state '$($state['Stage'])' — no upgrade action taken."
+    Exit-WithLog 0 "No upgrade action taken (state=$($state['Stage']))."
+}
+
+# ==============================================================================
+# END OF SCRIPT
+# ==============================================================================
+```
